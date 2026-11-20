@@ -14,6 +14,7 @@ from app.fixtures import (
     RULE_TRIGGERS, METRIC_DEFS, QUALITY_SAMPLES,
     PARTITION_STATS, EVENT_ROUTES,
 )
+from app.services.user_action_delivery import service as delivery_service
 from app.store import store
 
 
@@ -104,22 +105,84 @@ def run_window_metric_pipeline(window_id: str | None = None) -> dict:
 
 
 # Pipeline 3: rule_engine -> event_router -> pipeline_orch
-def run_rule_router_pipeline() -> dict:
-    """规则引擎触发后的事件路由。"""
-    triggers = list(RULE_TRIGGERS)
-    routes = {r["规则编号"]: r.get("目标管道", "default") for r in EVENT_ROUTES}
-    routing: dict[str, list] = {}
-    total_hits = 0
-    for t in triggers:
-        rid = t["规则编号"]
-        route = routes.get(rid, "default")
-        if route not in routing:
-            routing[route] = []
-        hits = len(t.get("命中用户", []))
-        total_hits += hits
-        routing[route].append({"规则": rid, "动作": t["动作"], "命中": hits})
+def rule_hits(now: str | None = None) -> list[dict]:
+    """把规则触发展开成用户级命中，交给事件路由做动作去重。
 
-    result = {"rules_fired": len(triggers), "total_hits": total_hits, "routing": routing}
+    这一层只负责「谁在哪条业务事件上命中了哪类动作」，同一用户在同一业务事件
+    上被多条规则命中时会展开成多条命中，由交付层按 (用户, 业务事件, 动作类别)
+    合并归属。
+    """
+    routes = {r["规则编号"]: r.get("目标管道", "default") for r in EVENT_ROUTES}
+    hits: list[dict] = []
+    for trigger in RULE_TRIGGERS:
+        users = list(trigger.get("命中用户") or [])
+        if not users:
+            continue
+        for user in users:
+            hits.append({
+                "用户ID": user,
+                "业务事件": trigger.get("业务事件") or trigger.get("订单编号") or trigger["规则编号"],
+                "订单编号": trigger.get("订单编号") or trigger.get("业务事件"),
+                "动作": trigger.get("动作"),
+                "动作类别": trigger.get("动作类别") or trigger.get("动作"),
+                "规则编号": trigger["规则编号"],
+                "目标管道": trigger.get("目标管道") or routes.get(trigger["规则编号"], "default"),
+                "优先级": trigger.get("优先级", 0),
+                "触发时间": trigger.get("触发时间") or now,
+            })
+    return hits
+
+
+def run_rule_router_pipeline(now: str | None = None) -> dict:
+    """规则引擎触发后的事件路由：去重、确认、真实投递到目标管道。"""
+    triggers = list(RULE_TRIGGERS)
+    hits = rule_hits(now=now)
+
+    # 用户级命中进入事件路由；按 (用户, 业务事件, 动作类别) 合并归属。
+    outcome = delivery_service.submit_hits(hits, now=now)
+    # 路由确认：待投递归属写入用户动作交付批次并标记已确认。
+    confirmed = delivery_service.confirm_pending(now=now)
+    # 只有写进目标管道才算交付完成；写入失败的批次留在待重试。
+    delivered = delivery_service.deliver_pending(now=now)
+
+    ownership = outcome.get("ownership", [])
+    routing: dict[str, list] = {}
+    for item in ownership:
+        route = str(item.get("目标管道") or "default")
+        sources = list(item.get("命中来源") or [])
+        routing.setdefault(route, []).append({
+            "归属编号": item.get("归属编号"),
+            "业务事件": item.get("业务事件"),
+            "动作类别": item.get("动作类别"),
+            "命中来源": sources,
+            "规则": "、".join(sources),
+            "动作": item.get("动作"),
+            "命中": len(sources),
+            "交付状态": item.get("交付状态"),
+            "交付回执": item.get("交付回执"),
+        })
+
+    rejected = [
+        item for item in ownership
+        if item.get("交付状态") == "无法投递"
+    ]
+    batches = [dict(r) for r in delivery_service.batch_rows]
+    result = {
+        "rules_fired": len(triggers),
+        "total_hits": len(hits),
+        "unique_actions": outcome.get("unique", len(ownership)),
+        "unique_hits": outcome.get("unique", len(ownership)),
+        "deduplicated": outcome.get("duplicates", 0),
+        "deduplicated_hits": outcome.get("duplicates", 0),
+        "delivered": len(delivered),
+        "delivered_batches": len(delivered),
+        "pending_retry": len(delivery_service.pending_retry_deliveries()),
+        "rejected": rejected,
+        "routing": routing,
+        "ownership": ownership,
+        "batches": batches,
+        "delivery_batches": batches,
+    }
     _wr("rule_router_orch", {"source": ["rule_engine", "event_router"], "target": "pipeline_orch", "payload": result})
     return result
 

@@ -75,5 +75,26 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 用户动作交付
+
+规则触发后的用户级命中经 `rule_engine -> event_router` 进入交付层
+（`app/services/user_action_delivery.py`），幂等与投递规则如下：
+
+- 归属键是 **用户ID + 业务事件 + 动作类别**。同一归属键只保留一份有效动作，
+  多条规则命中同一个人时规则编号累加到 `命中来源`；其他用户、其他业务事件、
+  其他动作类别照常各写一份。
+- 归属确认后写入 `user_action_delivery_batch`（用户动作交付批次），投递状态区分
+  `已确认` 与 `待重试`；只有动作真正写进目标管道才变成 `已交付` 并生成交付回执，
+  未写入的批次不能算交付完成。
+- 接收管道用 `交付回执` 可以查回订单；一条管道接单后，另一条管道即使收到原样
+  补送也领不到同一笔订单。
+- 低优先级命中先到、高优先级命中随后到达且动作仍未确认时，由高优先级接管目标
+  管道；已确认或已交付的归属不再改投。
+- 目标管道缺少该动作类别的交付权限时直接判为 `无法投递`，不会改用其他管道。
+
+接口：`/api/event_router/{hits,deliveries,ownership,claims}`、
+`/api/event_router/receipt/{receipt}`，以及同一份实现的
+`/api/user_action_delivery/*`；`POST /api/pipeline/rule-router` 会跑完整链路。
+
 领域：数据工程
 子方向：数仓与数据湖

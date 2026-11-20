@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.event_router import EventRouterService
+from app.services.user_action_delivery import service as delivery_service
 
 router = APIRouter(prefix="/api/event_router", tags=["事件路由"])
 
@@ -63,6 +64,78 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="event_router.csv"'})
+
+
+@router.get("/deliveries", response_model=PageResult[dict])
+def list_deliveries(
+    user: str | None = Query(default=None, description="用户ID"),
+    event: str | None = Query(default=None, description="业务事件"),
+    category: str | None = Query(default=None, description="动作类别"),
+    order: str | None = Query(default=None, description="订单编号"),
+    pipeline: str | None = Query(default=None, description="目标管道"),
+    status: str | None = Query(default=None, description="待投递、已确认、待重试、已交付、无法投递"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=500),
+) -> PageResult[dict]:
+    """按用户、业务事件、动作类别查看事件路由写入的交付批次。"""
+    items, total = service.list_deliveries(
+        user=user, event=event, category=category, order=order,
+        pipeline=pipeline, status=status, page=page, size=size)
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/ownership", response_model=PageResult[dict])
+def list_ownership(
+    user: str | None = Query(default=None),
+    event: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    order: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=500),
+) -> PageResult[dict]:
+    """查看用户动作归属清单，含命中来源与投递状态回写。"""
+    items, total = service.list_ownership(
+        user=user, event=event, category=category, order=order,
+        status=status, page=page, size=size)
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/receipt/{receipt}", response_model=dict)
+def lookup_receipt(receipt: str) -> dict:
+    """接收管道凭原交付回执查回订单。"""
+    batch = service.lookup_receipt(receipt)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"交付回执 {receipt} 不存在")
+    return {"ok": True, "batch": batch, "订单编号": batch.get("订单编号"), "交付回执": receipt}
+
+
+@router.post("/hits", response_model=dict)
+def route_hits(payload: list[dict] | dict) -> dict:
+    """用户级命中进入事件路由：同一用户同类动作只写一份，命中来源全部保留。"""
+    hits = payload.get("hits", []) if isinstance(payload, dict) else payload
+    if not hits:
+        return {"ok": False, "message": "没有可路由的用户命中", "accepted": []}
+    outcome = delivery_service.process_hits(hits)
+    outcome["message"] = (
+        f"命中 {outcome['hits']} 条，归属 {outcome['unique']} 份，"
+        f"合并重复 {outcome['duplicates']} 条，交付 {len(outcome.get('delivered', []))} 份"
+    )
+    return outcome
+
+
+@router.post("/claims", response_model=ActionResult)
+def claim_order(payload: dict) -> ActionResult:
+    """接收管道领取订单：优先用原交付回执反查，补送不能绕过归属再领一次。"""
+    result = service.claim_order(
+        str(payload.get("pipeline") or payload.get("管道") or ""),
+        receipt=payload.get("receipt") or payload.get("交付回执"),
+        order=payload.get("order") or payload.get("订单编号"),
+        user=payload.get("user") or payload.get("用户ID"),
+        event=payload.get("event") or payload.get("业务事件"),
+        category=payload.get("category") or payload.get("动作类别"),
+    )
+    return ActionResult(ok=bool(result.get("ok")), message=result.get("message", ""), entry=result)
 
 
 @router.get("/{entry_id}", response_model=dict)

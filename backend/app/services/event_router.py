@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.user_action_delivery import service as delivery_service
 from app.store import store
 
 MODULE = "event_router"
@@ -63,3 +64,14 @@ class EventRouterService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"路由规则已{action}"
+
+    def list_deliveries(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
+        """查看事件路由写入的用户动作交付批次。"""
+        return delivery_service.list_batches(**kwargs)
+
+    def list_ownership(self, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
+        return delivery_service.list_ownership(**kwargs)
+
+    def claim_order(self, pipeline: str, **kwargs: Any) -> dict[str, Any]:
+        """接收管道领取订单：回执反查优先，其次按交付批次归属。"""
+        return delivery_service.claim_delivery(pipeline, **kwargs)
